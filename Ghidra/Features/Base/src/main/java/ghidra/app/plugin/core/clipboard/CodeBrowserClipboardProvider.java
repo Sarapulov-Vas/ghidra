@@ -26,6 +26,7 @@ import javax.swing.event.ChangeEvent;
 import javax.swing.event.ChangeListener;
 
 import org.apache.commons.lang3.StringUtils;
+import org.apache.commons.text.StringEscapeUtils;
 
 import docking.ActionContext;
 import docking.ComponentProvider;
@@ -51,6 +52,7 @@ import ghidra.program.database.mem.AddressSourceInfo;
 import ghidra.program.database.symbol.CodeSymbol;
 import ghidra.program.database.symbol.FunctionSymbol;
 import ghidra.program.model.address.*;
+import ghidra.program.model.data.*;
 import ghidra.program.model.listing.*;
 import ghidra.program.model.mem.Memory;
 import ghidra.program.model.mem.MemoryBlock;
@@ -82,6 +84,8 @@ public class CodeBrowserClipboardProvider extends ByteCopier
 		new ClipboardType(DataFlavor.stringFlavor, "Memory Block Offset");
 	public static final ClipboardType CODE_TEXT_TYPE =
 		new ClipboardType(DataFlavor.stringFlavor, "Formatted Code");
+	public static final ClipboardType C_OBJECT_TYPE =
+			new ClipboardType(DataFlavor.stringFlavor, "C Object");
 	public static final ClipboardType LABELS_COMMENTS_TYPE =
 		new ClipboardType(CodeUnitInfoTransferable.localDataTypeFlavor, "Labels and Comments");
 	public static final ClipboardType LABELS_TYPE =
@@ -104,6 +108,7 @@ public class CodeBrowserClipboardProvider extends ByteCopier
 		List<ClipboardType> list = new LinkedList<>();
 
 		list.add(CODE_TEXT_TYPE);
+		list.add(C_OBJECT_TYPE);
 		list.add(LABELS_COMMENTS_TYPE);
 		list.add(LABELS_TYPE);
 		list.add(COMMENTS_TYPE);
@@ -268,6 +273,9 @@ public class CodeBrowserClipboardProvider extends ByteCopier
 		}
 		else if (copyType == CODE_TEXT_TYPE) {
 			return copyCode(monitor);
+		}
+		else if (copyType == C_OBJECT_TYPE) {
+			return copyCObject(monitor);
 		}
 		else if (copyType == LABELS_COMMENTS_TYPE) {
 			return copyLabelsComments(true, true, monitor);
@@ -522,6 +530,107 @@ public class CodeBrowserClipboardProvider extends ByteCopier
 		}
 
 		return createStringTransferable(g.getBuffer());
+	}
+
+	protected Transferable copyCObject(TaskMonitor monitor) {
+		Listing listing = currentProgram.getListing();
+		StringBuilder strBuildet = new StringBuilder();
+		CodeUnitIterator codeUnits = listing.getCodeUnits(getSelectedAddresses(), true);
+		while (codeUnits.hasNext() && !monitor.isCancelled()) {
+			CodeUnit codeUnit = codeUnits.next();
+			strBuildet.append(convertCodeUnitToCObject(codeUnit));
+		}
+
+		return createStringTransferable(strBuildet.toString());
+	}
+
+	private String convertCodeUnitToCObject(CodeUnit codeUnit)
+	{
+		if (codeUnit instanceof Data && codeUnit.getLabel() != null)
+		{
+			Data data = (Data) codeUnit;
+			StringBuilder stringBuilder = new StringBuilder();
+			stringBuilder.append(getDeclarration(data));
+			Object value = data.getValue();
+			if (value != null)
+			{
+				String cObject = convertValueToCObject(value);
+				if (cObject != null)
+				{
+					stringBuilder.append(" = ");
+					stringBuilder.append(cObject);
+				}
+			}
+
+			stringBuilder.append(";\n");
+			return stringBuilder.toString();
+		}
+
+		return "";
+	}
+
+	private String getDeclarration (Data codeUnit)
+	{
+		StringBuilder stringBuilder = new StringBuilder();
+		if (codeUnit.isArray())
+		{
+			return getArrayDeclaration(codeUnit);
+		}
+
+		stringBuilder.append(codeUnit.getDataType().getName() + " ");
+		stringBuilder.append(codeUnit.getLabel());
+		return stringBuilder.toString();
+	}
+
+	private String getArrayDeclaration (Data codeUnit)
+	{
+		StringBuilder stringBuilder = new StringBuilder();
+	    StringBuilder arraySize = new StringBuilder();
+	    while (codeUnit.getDataType() instanceof Array)
+	    {
+	        arraySize.append("[" + codeUnit.getNumComponents() + "]");
+	        codeUnit = codeUnit.getComponent(0);
+	    }
+
+	    stringBuilder.append(codeUnit.getDataType().getName());
+	    stringBuilder.append(" ");
+	    stringBuilder.append(codeUnit.getLabel());
+	    stringBuilder.append(arraySize.toString());
+	    return stringBuilder.toString();
+	}
+
+	private String convertValueToCObject (Object value)
+	{
+		if (value instanceof List<?>)
+		{
+			StringJoiner stringJoiner = new StringJoiner(", ", "{", "}");
+			for (Object element : (List<?>) value)
+			{
+				stringJoiner.add(convertValueToCObject(element));
+			}
+
+			return stringJoiner.toString();
+		}
+		else if (value instanceof Address)
+		{
+			CodeUnit pointer = currentProgram.getListing().getCodeUnitAt((Address) value);
+			if (pointer instanceof Data && ((Data) pointer).hasStringValue())
+			{
+				return convertValueToCObject(((Data) pointer).getValue());
+			}
+
+			return pointer != null ? "&" + pointer.getLabel() : null;
+		}
+		else if (value instanceof Character)
+		{
+			return "'" + StringEscapeUtils.escapeJava(value.toString()) + "'";
+		}
+		else if (value instanceof String)
+		{
+			return "\"" + StringEscapeUtils.escapeJava(value.toString()) + "\"";
+		}
+
+		return value.toString();
 	}
 
 	private Transferable copyByteString(Address address) {
