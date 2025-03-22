@@ -533,7 +533,7 @@ public class CodeBrowserClipboardProvider extends ByteCopier
 
 	protected Transferable copyCObject(TaskMonitor monitor) {
 		Listing listing = currentProgram.getListing();
-		StringBuilder strBuildet = new StringBuilder();
+		StringBuilder strBuilder = new StringBuilder();
 		CodeUnitIterator codeUnits = listing.getCodeUnits(getSelectedAddresses(), true);
 		while (codeUnits.hasNext() && !monitor.isCancelled()) {
 			CodeUnit codeUnit = codeUnits.next();
@@ -542,12 +542,12 @@ public class CodeBrowserClipboardProvider extends ByteCopier
 				String value = ((Data) codeUnit).getValueAsCObject();
 				if (value != null && value != "")
 				{
-					strBuildet.append(value + "\n");
+					strBuilder.append(value + "\n");
 				}
 			}
 		}
 
-		return createStringTransferable(strBuildet.toString());
+		return createStringTransferable(strBuilder.toString());
 	}
 
 	private Transferable copyByteString(Address address) {
