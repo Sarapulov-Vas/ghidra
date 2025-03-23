@@ -34,6 +34,7 @@ import ghidra.program.model.address.Address;
 import ghidra.program.model.address.AddressSetView;
 import ghidra.program.model.data.*;
 import ghidra.program.model.listing.*;
+import ghidra.program.model.mem.MemoryBlock;
 import ghidra.program.model.symbol.Equate;
 import ghidra.util.HelpLocation;
 import ghidra.util.Msg;
@@ -125,6 +126,7 @@ public class CppExporter extends Exporter {
 			if (emitDataTypeDefinitions) {
 				writeEquates(program, header, headerWriter, cFileWriter, chunkingMonitor);
 				writeProgramDataTypes(program, header, headerWriter, cFileWriter, chunkingMonitor);
+				writeProgramData(program, cFileWriter, chunkingMonitor);
 			}
 			chunkingMonitor.checkCancelled();
 
@@ -152,6 +154,90 @@ public class CppExporter extends Exporter {
 			}
 		}
 
+	}
+
+	private String convertCodeUnitToCObject(Data data)
+	{
+		StringBuilder stringBuilder = new StringBuilder();
+		stringBuilder.append(getDeclaration(data));
+		String cObject = data.getValueAsCObject();
+		if (cObject != "" && cObject != null)
+		{
+			stringBuilder.append(" = ");
+			stringBuilder.append(cObject);
+		}
+
+		stringBuilder.append(";");
+		return stringBuilder.toString();
+	}
+
+	private String getDeclaration(Data codeUnit)
+	{
+		if (codeUnit.isArray())
+		{
+			return getArrayDeclaration(codeUnit);
+		}
+
+		StringBuilder stringBuilder = new StringBuilder();
+		if (codeUnit.hasStringValue())
+		{
+			stringBuilder.append("char * ");
+			stringBuilder.append(codeUnit.getLabel());
+			return stringBuilder.toString();
+		}
+
+		stringBuilder.append(codeUnit.getDataType().getName() + " ");
+		stringBuilder.append(codeUnit.getLabel());
+		return stringBuilder.toString();
+	}
+
+	private String getArrayDeclaration(Data codeUnit)
+	{
+		StringBuilder stringBuilder = new StringBuilder();
+	    StringBuilder arraySize = new StringBuilder();
+	    while (codeUnit.getDataType() instanceof Array)
+	    {
+	        arraySize.append("[" + codeUnit.getNumComponents() + "]");
+	        codeUnit = codeUnit.getComponent(0);
+	    }
+
+	    stringBuilder.append(codeUnit.getDataType().getName());
+	    stringBuilder.append(" ");
+	    stringBuilder.append(codeUnit.getLabel());
+	    stringBuilder.append(arraySize.toString());
+	    return stringBuilder.toString();
+	}
+
+	private void writeProgramData(Program program, PrintWriter cFileWriter,
+			TaskMonitor monitor) throws IOException, CancelledException {
+		if (cFileWriter != null) {
+			Listing listing = program.getListing();
+			for (MemoryBlock memBlock : program.getMemory().getBlocks())
+			{
+				if (memBlock.isExecute() || memBlock.isArtificial() || memBlock.isExternalBlock() ||
+					memBlock.isOverlay())
+				{
+					continue;
+				}
+
+				CodeUnitIterator codeUnits = listing.getCodeUnits(memBlock.getStart(), true);
+				while (codeUnits.hasNext() && !monitor.isCancelled()) {
+					CodeUnit codeUnit = codeUnits.next();
+					if (codeUnit.getAddress().compareTo(memBlock.getEnd()) > 0)
+					{
+						break;
+					}
+
+					if (codeUnit instanceof Data && codeUnit.getLabel() != null)
+					{
+						cFileWriter.println(convertCodeUnitToCObject((Data) codeUnit));
+					}
+				}
+			}
+
+			cFileWriter.println("");
+			cFileWriter.println("");
+		}
 	}
 
 	private void decompileAndExport(AddressSetView addrSet, Program program,
