@@ -17,6 +17,7 @@ package ghidra.app.util.exporter;
 
 import java.io.*;
 import java.util.*;
+import java.util.regex.Pattern;
 import java.nio.file.Files;
 import java.nio.file.Paths;
 
@@ -32,11 +33,13 @@ import ghidra.app.decompiler.component.DecompilerUtils;
 import ghidra.app.decompiler.parallel.ChunkingParallelDecompiler;
 import ghidra.app.decompiler.parallel.ParallelDecompiler;
 import ghidra.app.util.*;
+import ghidra.app.util.opinion.ElfLoader;
 import ghidra.framework.model.DomainObject;
 import ghidra.program.model.address.Address;
 import ghidra.program.model.address.AddressSetView;
 import ghidra.program.model.data.*;
 import ghidra.program.model.listing.*;
+import ghidra.program.model.mem.MemoryBlock;
 import ghidra.program.model.symbol.Equate;
 import ghidra.util.HelpLocation;
 import ghidra.util.Msg;
@@ -50,6 +53,7 @@ public class CppExporter extends Exporter {
 	public static final String CREATE_HEADER_FILE = "Create Header File (.h)";
 	public static final String USE_CPP_STYLE_COMMENTS = "Use C++ Style Comments (//)";
 	public static final String EMIT_TYPE_DEFINITONS = "Emit Data-type Definitions";
+	public static final String EXPORT_GLOBAL_VARIABLES = "Export Global Variables";
 	public static final String FUNCTION_TAG_FILTERS = "Function Tags to Filter";
 	public static final String FUNCTION_TAG_EXCLUDE = "Function Tags Excluded";
 	public static final String C_RUNTIME_EXCLUDE = "Exclude C Runtime functions";
@@ -61,10 +65,18 @@ public class CppExporter extends Exporter {
 	private boolean isCreateCFile = true;
 	private boolean isUseCppStyleComments = true;
 	private boolean emitDataTypeDefinitions = true;
+	private boolean exportGlobalVariables = true;
 	private boolean excludeCRuntime = true;
 	private boolean excludePLTTrampolines = true;
 	private boolean includeHeaderFiles = true;
 	private String tagOptions = "";
+	private Set<String> exclude_sections = new HashSet<>(Arrays.asList(
+	        ".dynamic", ".got", ".got.plt", ".plt", ".eh_frame", ".init_array", ".fini_array", ".interp", ".eh_frame_hdr", ".eh_frame"
+	    ));
+
+	private Set<String> exclude_variables = new HashSet<>(Arrays.asList(
+	        "_IO_stdin_used", "data_start", "__dso_handle"
+	    ));
 
 	private Set<FunctionTag> functionTagSet = new HashSet<>();
 	private boolean excludeMatchingTags = true;
@@ -131,15 +143,19 @@ public class CppExporter extends Exporter {
 			if (includeHeaderFiles) {
 				writeIncludeHeaders(program, header, headerWriter, cFileWriter);
 			}
+      
+      if (cFileWriter != null && headerWriter != null) {
+				cFileWriter.println("#include \"" + header.getName() + "\"");
+			}
 
 			if (emitDataTypeDefinitions) {
 				writeEquates(program, header, headerWriter, cFileWriter, chunkingMonitor);
 				writeProgramDataTypes(program, header, headerWriter, cFileWriter, chunkingMonitor);
 			}
 
-			if (cFileWriter != null && headerWriter != null) {
-				cFileWriter.println("#include \"" + header.getName() + "\"");
-			}
+			if (exportGlobalVariables) {
+				writeProgramData(program, cFileWriter, chunkingMonitor);
+      }
 
 			chunkingMonitor.checkCancelled();
 
@@ -167,6 +183,95 @@ public class CppExporter extends Exporter {
 			}
 		}
 
+	}
+
+	private String convertCodeUnitToCObject(Data data) {
+		StringBuilder stringBuilder = new StringBuilder();
+		stringBuilder.append(getDeclaration(data));
+		String cObject = data.getValueAsCObject();
+		if (cObject != "" && cObject != null) {
+			stringBuilder.append(" = ");
+			stringBuilder.append(cObject);
+		}
+
+		stringBuilder.append(";");
+		return stringBuilder.toString();
+	}
+
+	private String getDeclaration(Data codeUnit)
+	{
+		if (codeUnit.isArray())
+		{
+			return getArrayDeclaration(codeUnit);
+		}
+
+		StringBuilder stringBuilder = new StringBuilder();
+		if (codeUnit.hasStringValue())
+		{
+			stringBuilder.append("char * ");
+			stringBuilder.append(codeUnit.getLabel());
+			return stringBuilder.toString();
+		}
+
+		stringBuilder.append(codeUnit.getDataType().getName() + " ");
+		stringBuilder.append(codeUnit.getLabel());
+		return stringBuilder.toString();
+	}
+
+	private String getArrayDeclaration(Data codeUnit) {
+		StringBuilder stringBuilder = new StringBuilder();
+	    StringBuilder arraySize = new StringBuilder();
+	    while (codeUnit.getDataType() instanceof Array) {
+	        arraySize.append("[" + codeUnit.getNumComponents() + "]");
+	        codeUnit = codeUnit.getComponent(0);
+	    }
+
+	    stringBuilder.append(codeUnit.getDataType().getName());
+	    stringBuilder.append(" ");
+	    stringBuilder.append(codeUnit.getLabel());
+	    stringBuilder.append(arraySize.toString());
+	    return stringBuilder.toString();
+	}
+
+	private void writeProgramData(Program program, PrintWriter cFileWriter,
+			TaskMonitor monitor) throws IOException, CancelledException {
+		if (cFileWriter != null)  {
+			String regex = "^[a-zA-Z_][a-zA-Z0-9_]*$";
+			Pattern pattern = Pattern.compile(regex);
+			Listing listing = program.getListing();
+			for (MemoryBlock block : program.getMemory().getBlocks()) {
+				if ((program.getExecutableFormat().equals(ElfLoader.ELF_NAME) && (exclude_sections.contains(block.getName()) ||
+						!(block.getComment().startsWith("SHT_NOBITS") || block.getComment().startsWith("SHT_PROGBITS")))) ||
+						!block.isLoaded() || block.isExecute() || block.isArtificial() || block.isExternalBlock()) {
+					continue;
+				}
+
+				CodeUnitIterator codeUnits = listing.getCodeUnits(block.getStart(), true);
+				while (codeUnits.hasNext() && !monitor.isCancelled()) {
+					CodeUnit codeUnit = codeUnits.next();
+					if (codeUnit.getAddress().compareTo(block.getEnd()) > 0) {
+						break;
+					}
+
+					if (codeUnit instanceof Data && codeUnit.getLabel() != null &&pattern.matcher(codeUnit.getLabel()).matches() &&
+							!exclude_variables.contains(codeUnit.getLabel())) {
+						try {
+							cFileWriter.println(convertCodeUnitToCObject((Data) codeUnit));
+						}
+						catch (Exception e) {
+							cFileWriter.print("// CodeUnit ");
+							cFileWriter.print(((Data) codeUnit).getDataType().getName());
+							cFileWriter.print(" ");
+							cFileWriter.print(codeUnit.getLabel());
+							cFileWriter.println(" cannot be converted to a C object.");
+						}
+					}
+				}
+			}
+
+			cFileWriter.println("");
+			cFileWriter.println("");
+		}
 	}
 
 	private void decompileAndExport(AddressSetView addrSet, Program program,
@@ -432,6 +537,7 @@ public class CppExporter extends Exporter {
 		list.add(new Option(CREATE_C_FILE, Boolean.valueOf(isCreateCFile)));
 		list.add(new Option(USE_CPP_STYLE_COMMENTS, Boolean.valueOf(isUseCppStyleComments)));
 		list.add(new Option(EMIT_TYPE_DEFINITONS, Boolean.valueOf(emitDataTypeDefinitions)));
+		list.add(new Option(EXPORT_GLOBAL_VARIABLES, Boolean.valueOf(exportGlobalVariables)));
 		list.add(new Option(INCLUDE_HEADER_FILES, Boolean.valueOf(includeHeaderFiles)));
 		list.add(new Option(FUNCTION_TAG_FILTERS, tagOptions));
 		list.add(new Option(FUNCTION_TAG_EXCLUDE, Boolean.valueOf(excludeMatchingTags)));
@@ -457,6 +563,9 @@ public class CppExporter extends Exporter {
 				else if (optName.equals(EMIT_TYPE_DEFINITONS)) {
 					emitDataTypeDefinitions = ((Boolean) option.getValue()).booleanValue();
 				}
+				else if (optName.equals(EXPORT_GLOBAL_VARIABLES)) {
+					exportGlobalVariables = ((Boolean) option.getValue()).booleanValue();
+        }
 				else if (optName.equals(INCLUDE_HEADER_FILES)) {
 					includeHeaderFiles = ((Boolean) option.getValue()).booleanValue();
 				}
