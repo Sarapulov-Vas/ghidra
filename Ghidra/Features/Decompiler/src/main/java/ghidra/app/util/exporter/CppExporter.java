@@ -18,9 +18,12 @@ package ghidra.app.util.exporter;
 import java.io.*;
 import java.util.*;
 import java.util.regex.Pattern;
+import java.nio.file.Files;
+import java.nio.file.Paths;
 
 import org.apache.commons.lang3.StringUtils;
 
+//import aQute.bnd.header.Attrs.DataType;
 import generic.cache.CachingPool;
 import generic.cache.CountingBasicFactory;
 import generic.concurrent.QCallback;
@@ -54,7 +57,8 @@ public class CppExporter extends Exporter {
 	public static final String FUNCTION_TAG_FILTERS = "Function Tags to Filter";
 	public static final String FUNCTION_TAG_EXCLUDE = "Function Tags Excluded";
 	public static final String C_RUNTIME_EXCLUDE = "Exclude C Runtime functions";
-
+	public static final String PLT_TRAMPOLINES_EXCLUDE = "Exclude PLT Trampolines";
+	public static final String INCLUDE_HEADER_FILES = "Include header files";
 	private static String EOL = System.getProperty("line.separator");
 
 	private boolean isCreateHeaderFile = false;
@@ -63,6 +67,8 @@ public class CppExporter extends Exporter {
 	private boolean emitDataTypeDefinitions = true;
 	private boolean exportGlobalVariables = true;
 	private boolean excludeCRuntime = true;
+	private boolean excludePLTTrampolines = true;
+	private boolean includeHeaderFiles = true;
 	private String tagOptions = "";
 	private Set<String> exclude_sections = new HashSet<>(Arrays.asList(
 	        ".dynamic", ".got", ".got.plt", ".plt", ".eh_frame", ".init_array", ".fini_array", ".interp", ".eh_frame_hdr", ".eh_frame"
@@ -134,6 +140,14 @@ public class CppExporter extends Exporter {
 			ParallelDecompiler.createChunkingParallelDecompiler(callback, chunkingMonitor);
 
 		try {
+			if (includeHeaderFiles) {
+				writeIncludeHeaders(program, header, headerWriter, cFileWriter);
+			}
+      
+      if (cFileWriter != null && headerWriter != null) {
+				cFileWriter.println("#include \"" + header.getName() + "\"");
+			}
+
 			if (emitDataTypeDefinitions) {
 				writeEquates(program, header, headerWriter, cFileWriter, chunkingMonitor);
 				writeProgramDataTypes(program, header, headerWriter, cFileWriter, chunkingMonitor);
@@ -141,7 +155,7 @@ public class CppExporter extends Exporter {
 
 			if (exportGlobalVariables) {
 				writeProgramData(program, cFileWriter, chunkingMonitor);
-			}
+      }
 
 			chunkingMonitor.checkCancelled();
 
@@ -301,10 +315,41 @@ public class CppExporter extends Exporter {
 		String functionName = function.getName();
 		return functionName.startsWith(CRT_PREFIX);
 	}
+		
+	private static final String PLT_TRAMPOLINE_INSTRUCTION_QWORD = "JMP qword ptr";
+	private static final String PLT_TRAMPOLINE_INSTRUCTION_DWORD = "JMP dword ptr";
+
+	private boolean isPLTTrampoline(Function function) {
+		Program program = function.getProgram();
+		Listing listing = program.getListing();
+		AddressSetView body = function.getBody();
+		for (Address address : body.getAddresses(true)) {
+			CodeUnit codeUnit = listing.getCodeUnitAt(address);
+			if (!(codeUnit instanceof Instruction))
+				continue;
+			Instruction instruction = (Instruction) codeUnit;
+			String instructionString = instruction.toString();
+			if (instructionString.startsWith(PLT_TRAMPOLINE_INSTRUCTION_QWORD)
+					|| instructionString.startsWith(PLT_TRAMPOLINE_INSTRUCTION_DWORD)) {
+				Object inputObject = instruction.getInputObjects()[0];
+				if (!(inputObject instanceof Address))
+					continue;
+				Address jmpAddress = (Address) inputObject;
+				if (!(body.contains(jmpAddress))) {
+					return true;
+				}
+			}
+		}
+		return false;
+	}
 	
 	private boolean excludeFunction(Function currentFunction) {
 
 		if (excludeCRuntime && isCRTFunction(currentFunction)) {
+			return true;
+		}
+
+		if (excludePLTTrampolines && isPLTTrampoline(currentFunction)) {
 			return true;
 		}
 		
@@ -391,6 +436,40 @@ public class CppExporter extends Exporter {
 		}
 	}
 
+	private void writeIncludeHeaders(Program program, File header, PrintWriter headerWriter,
+			PrintWriter cFileWriter) throws IOException, CancelledException {
+		if (headerWriter != null) {
+			headerWriter.print(getAllHeaderFiles(program));
+		}
+		else if (cFileWriter != null) {
+			cFileWriter.print(getAllHeaderFiles(program));
+		}
+
+		if (cFileWriter != null) {
+			cFileWriter.println("");
+			cFileWriter.println("");
+		}
+
+	}
+
+	private String getAllHeaderFiles(Program program) throws IOException  {
+		HashSet<String> headerList = new HashSet<String>();
+		String resultString = new String();
+		for (SourceArchive sourceArchive : program.getDataTypeManager().getSourceArchives())
+		{
+			for (DataType dataType :  program.getDataTypeManager().getDataTypes(sourceArchive)) {
+				String headerName = dataType.getPathName().substring(1, dataType.getPathName().indexOf(".h") + 2);
+				if (dataType.getPathName().contains(".h") &&
+						!headerList.contains(headerName)) {
+					headerList.add(headerName);
+					resultString = resultString.concat("#include <" + headerName + ">\n");
+				}
+			}
+		}
+
+		return resultString;
+	}
+
 	private void writeProgramDataTypes(Program program, File header, PrintWriter headerWriter,
 			PrintWriter cFileWriter, TaskMonitor monitor) throws IOException, CancelledException {
 		if (headerWriter != null) {
@@ -402,10 +481,6 @@ public class CppExporter extends Exporter {
 
 			headerWriter.println("");
 			headerWriter.println("");
-
-			if (cFileWriter != null) {
-				cFileWriter.println("#include \"" + header.getName() + "\"");
-			}
 		}
 		else if (cFileWriter != null) {
 			DataTypeManager dtm = program.getDataTypeManager();
@@ -463,9 +538,11 @@ public class CppExporter extends Exporter {
 		list.add(new Option(USE_CPP_STYLE_COMMENTS, Boolean.valueOf(isUseCppStyleComments)));
 		list.add(new Option(EMIT_TYPE_DEFINITONS, Boolean.valueOf(emitDataTypeDefinitions)));
 		list.add(new Option(EXPORT_GLOBAL_VARIABLES, Boolean.valueOf(exportGlobalVariables)));
+		list.add(new Option(INCLUDE_HEADER_FILES, Boolean.valueOf(includeHeaderFiles)));
 		list.add(new Option(FUNCTION_TAG_FILTERS, tagOptions));
 		list.add(new Option(FUNCTION_TAG_EXCLUDE, Boolean.valueOf(excludeMatchingTags)));
 		list.add(new Option(C_RUNTIME_EXCLUDE, Boolean.valueOf(excludeCRuntime)));
+		list.add(new Option(PLT_TRAMPOLINES_EXCLUDE, Boolean.valueOf(excludePLTTrampolines)));
 		return list;
 	}
 
@@ -488,6 +565,9 @@ public class CppExporter extends Exporter {
 				}
 				else if (optName.equals(EXPORT_GLOBAL_VARIABLES)) {
 					exportGlobalVariables = ((Boolean) option.getValue()).booleanValue();
+        }
+				else if (optName.equals(INCLUDE_HEADER_FILES)) {
+					includeHeaderFiles = ((Boolean) option.getValue()).booleanValue();
 				}
 				else if (optName.equals(FUNCTION_TAG_FILTERS)) {
 					tagOptions = (String) option.getValue();
@@ -497,6 +577,9 @@ public class CppExporter extends Exporter {
 				}
 				else if (optName.equals(C_RUNTIME_EXCLUDE)) {
 					excludeCRuntime = ((Boolean) option.getValue()).booleanValue();
+				}
+				else if (optName.equals(PLT_TRAMPOLINES_EXCLUDE)) {
+					excludePLTTrampolines = ((Boolean) option.getValue()).booleanValue();
 				}
 				else {
 					throw new OptionException("Unknown option: " + optName);
